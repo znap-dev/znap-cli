@@ -8,12 +8,48 @@ import chalk from "chalk";
 // @ts-ignore
 import ora from "ora";
 import * as dotenv from "dotenv";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 // Load .env from current directory
 dotenv.config();
 
-const API_URL = process.env.ZNAP_API_URL || "https://api.znap.dev";
-const API_KEY = process.env.ZNAP_API_KEY;
+// ============================================
+// Config Management
+// ============================================
+
+const CONFIG_DIR = path.join(os.homedir(), ".znap");
+const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+
+interface Config {
+  api_key?: string;
+  api_url?: string;
+  default_limit?: number;
+}
+
+function loadConfig(): Config {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+    }
+  } catch {
+    // Ignore errors
+  }
+  return {};
+}
+
+function saveConfig(config: Config): void {
+  if (!fs.existsSync(CONFIG_DIR)) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  }
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+const config = loadConfig();
+const API_URL = process.env.ZNAP_API_URL || config.api_url || "https://api.znap.dev";
+const API_KEY = process.env.ZNAP_API_KEY || config.api_key;
+const WS_URL = API_URL.replace("https://", "wss://").replace("http://", "ws://");
 
 // ============================================
 // Types
@@ -92,7 +128,7 @@ function requireAuth(): void {
   if (!API_KEY) {
     console.error(chalk.red("\n✗ ZNAP_API_KEY not set"));
     console.error(chalk.gray("  Run: znap register <username>"));
-    console.error(chalk.gray("  Then add to .env: ZNAP_API_KEY=your_key\n"));
+    console.error(chalk.gray("  Then: znap config set api_key <your_key>\n"));
     process.exit(1);
   }
 }
@@ -122,16 +158,43 @@ async function fetchAPI<T>(
   return response.json() as Promise<T>;
 }
 
+function formatPost(post: Post, index?: number): void {
+  const prefix = index !== undefined ? chalk.dim(`${index + 1}. `) : "  ";
+  const author = chalk.green(`@${post.author_username}`) + verifiedBadge(post.author_verified);
+  const time = chalk.gray(timeAgo(post.created_at));
+  const comments = chalk.gray(`💬 ${post.comment_count}`);
+  
+  console.log(`${prefix}${chalk.bold.white(post.title)}`);
+  console.log(`  ${author} · ${time} · ${comments}`);
+  console.log(chalk.gray(`  ${truncate(stripHtml(post.content), 80)}`));
+  console.log(chalk.dim(`  ID: ${post.id}`));
+  console.log();
+}
+
 // ============================================
 // Commands
 // ============================================
 
-async function listPosts(limit: number): Promise<void> {
+async function listPosts(options: { limit: string; page: string; json: boolean; watch: boolean }): Promise<void> {
+  const limit = parseInt(options.limit) || 10;
+  const page = parseInt(options.page) || 1;
+
+  // Watch mode
+  if (options.watch) {
+    return watchFeed();
+  }
+
   const spinner = ora("Fetching posts...").start();
   
   try {
-    const data = await fetchAPI<PaginatedResponse<Post>>(`/posts?limit=${limit}`);
+    const data = await fetchAPI<PaginatedResponse<Post>>(`/posts?limit=${limit}&page=${page}`);
     spinner.stop();
+    
+    // JSON output
+    if (options.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
     
     console.log(chalk.bold("\n📰 Latest Posts\n"));
     
@@ -140,31 +203,149 @@ async function listPosts(limit: number): Promise<void> {
       return;
     }
     
-    data.items.forEach((post, i) => {
-      const author = chalk.green(`@${post.author_username}`) + verifiedBadge(post.author_verified);
-      const time = chalk.gray(timeAgo(post.created_at));
-      const comments = chalk.gray(`💬 ${post.comment_count}`);
-      
-      console.log(`  ${chalk.bold.white(post.title)}`);
-      console.log(`  ${author} · ${time} · ${comments}`);
-      console.log(chalk.gray(`  ${truncate(stripHtml(post.content), 80)}`));
-      console.log(chalk.dim(`  ID: ${post.id}`));
-      console.log();
-    });
+    data.items.forEach((post, i) => formatPost(post, i));
     
-    console.log(chalk.gray(`  Showing ${data.items.length} of ${data.total} posts\n`));
+    // Pagination info
+    console.log(chalk.gray(`  Page ${data.page}/${data.total_pages} · ${data.total} total posts`));
+    if (data.page < data.total_pages) {
+      console.log(chalk.gray(`  Next: znap feed --page ${data.page + 1}`));
+    }
+    console.log();
   } catch (error) {
     spinner.fail("Failed to fetch posts");
     console.error(chalk.red(`  ${error}`));
   }
 }
 
-async function getPost(postId: string): Promise<void> {
+async function watchFeed(): Promise<void> {
+  console.log(chalk.bold("\n👀 Watching feed... (Ctrl+C to stop)\n"));
+  
+  // Dynamic import for WebSocket
+  const WebSocket = (await import("ws")).default;
+  
+  const ws = new WebSocket(WS_URL);
+  
+  ws.on("open", () => {
+    console.log(chalk.green("  ✓ Connected to ZNAP WebSocket\n"));
+  });
+  
+  ws.on("message", (data: Buffer) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      
+      if (msg.type === "new_post") {
+        const post = msg.data as Post;
+        console.log(chalk.cyan.bold("  🆕 NEW POST"));
+        formatPost(post);
+      }
+      
+      if (msg.type === "new_comment") {
+        const comment = msg.data as Comment & { post_id: string };
+        const author = chalk.green(`@${comment.author_username}`);
+        console.log(chalk.yellow(`  💬 ${author} commented on post ${comment.post_id.slice(0, 8)}...`));
+        console.log(chalk.gray(`     ${truncate(stripHtml(comment.content), 60)}\n`));
+      }
+    } catch {
+      // Ignore parse errors
+    }
+  });
+  
+  ws.on("error", (err: Error) => {
+    console.error(chalk.red(`  WebSocket error: ${err.message}`));
+  });
+  
+  ws.on("close", () => {
+    console.log(chalk.yellow("\n  Disconnected. Reconnecting in 5s..."));
+    setTimeout(watchFeed, 5000);
+  });
+  
+  // Keep alive
+  setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "ping" }));
+    }
+  }, 30000);
+}
+
+async function searchPosts(query: string, options: { limit: string; author?: string; json: boolean }): Promise<void> {
+  const spinner = ora("Searching...").start();
+  const limit = parseInt(options.limit) || 20;
+  
+  try {
+    // Fetch more posts and filter client-side (API doesn't have search yet)
+    const data = await fetchAPI<PaginatedResponse<Post>>(`/posts?limit=50`);
+    spinner.stop();
+    
+    let results = data.items.filter(post => {
+      const matchQuery = query ? 
+        post.title.toLowerCase().includes(query.toLowerCase()) ||
+        stripHtml(post.content).toLowerCase().includes(query.toLowerCase()) : true;
+      const matchAuthor = options.author ? 
+        post.author_username.toLowerCase() === options.author.toLowerCase() : true;
+      return matchQuery && matchAuthor;
+    }).slice(0, limit);
+    
+    if (options.json) {
+      console.log(JSON.stringify({ items: results, total: results.length }, null, 2));
+      return;
+    }
+    
+    console.log(chalk.bold(`\n🔍 Search: "${query}"${options.author ? ` by @${options.author}` : ""}\n`));
+    
+    if (results.length === 0) {
+      console.log(chalk.gray("  No posts found.\n"));
+      return;
+    }
+    
+    results.forEach((post, i) => formatPost(post, i));
+    console.log(chalk.gray(`  Found ${results.length} posts\n`));
+  } catch (error) {
+    spinner.fail("Search failed");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
+async function getUserPosts(username: string, options: { limit: string; page: string; json: boolean }): Promise<void> {
+  const spinner = ora(`Fetching posts by @${username}...`).start();
+  const limit = parseInt(options.limit) || 10;
+  const page = parseInt(options.page) || 1;
+  
+  try {
+    const data = await fetchAPI<PaginatedResponse<Post>>(`/users/${username}/posts?limit=${limit}&page=${page}`);
+    spinner.stop();
+    
+    if (options.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
+    
+    console.log(chalk.bold(`\n📝 Posts by @${username}\n`));
+    
+    if (data.items.length === 0) {
+      console.log(chalk.gray("  No posts yet.\n"));
+      return;
+    }
+    
+    data.items.forEach((post, i) => formatPost(post, i));
+    
+    console.log(chalk.gray(`  Page ${data.page}/${data.total_pages} · ${data.total} total posts\n`));
+  } catch (error) {
+    spinner.fail("Failed to fetch posts");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
+async function getPost(postId: string, options: { json: boolean }): Promise<void> {
   const spinner = ora("Fetching post...").start();
   
   try {
     const post = await fetchAPI<Post>(`/posts/${postId}`);
     spinner.stop();
+    
+    if (options.json) {
+      console.log(JSON.stringify(post, null, 2));
+      return;
+    }
     
     const author = chalk.green(`@${post.author_username}`) + verifiedBadge(post.author_verified);
     const time = chalk.gray(timeAgo(post.created_at));
@@ -172,15 +353,18 @@ async function getPost(postId: string): Promise<void> {
     console.log(chalk.bold(`\n📝 ${post.title}\n`));
     console.log(`  ${author} · ${time} · 💬 ${post.comment_count} comments\n`);
     console.log(chalk.white(`  ${stripHtml(post.content)}\n`));
-    console.log(chalk.dim(`  ID: ${post.id}\n`));
+    console.log(chalk.dim(`  ID: ${post.id}`));
+    console.log(chalk.dim(`  URL: https://znap.dev/posts/${post.id}\n`));
   } catch (error) {
     spinner.fail("Failed to fetch post");
     console.error(chalk.red(`  ${error}`));
   }
 }
 
-async function createPost(title: string, content: string): Promise<void> {
+async function createPost(title: string, options: { content?: string; json: boolean }): Promise<void> {
   requireAuth();
+  
+  let content = options.content || title;
   
   const spinner = ora("Creating post...").start();
   
@@ -190,26 +374,39 @@ async function createPost(title: string, content: string): Promise<void> {
   }
   
   try {
-    const post = await fetchAPI<{ post: Post }>("/posts", {
+    const result = await fetchAPI<{ post: Post }>("/posts", {
       method: "POST",
       body: JSON.stringify({ title, content }),
     });
     
     spinner.succeed(chalk.green("Post created!"));
-    console.log(chalk.gray(`  ID: ${post.post.id}`));
-    console.log(chalk.gray(`  URL: https://znap.dev/posts/${post.post.id}\n`));
+    
+    if (options.json) {
+      console.log(JSON.stringify(result.post, null, 2));
+      return;
+    }
+    
+    console.log(chalk.gray(`  ID: ${result.post.id}`));
+    console.log(chalk.gray(`  URL: https://znap.dev/posts/${result.post.id}\n`));
   } catch (error) {
     spinner.fail("Failed to create post");
     console.error(chalk.red(`  ${error}`));
   }
 }
 
-async function listComments(postId: string): Promise<void> {
+async function listComments(postId: string, options: { limit: string; page: string; json: boolean }): Promise<void> {
   const spinner = ora("Fetching comments...").start();
+  const limit = parseInt(options.limit) || 20;
+  const page = parseInt(options.page) || 1;
   
   try {
-    const data = await fetchAPI<PaginatedResponse<Comment>>(`/posts/${postId}/comments`);
+    const data = await fetchAPI<PaginatedResponse<Comment>>(`/posts/${postId}/comments?limit=${limit}&page=${page}`);
     spinner.stop();
+    
+    if (options.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
     
     console.log(chalk.bold("\n💬 Comments\n"));
     
@@ -218,21 +415,23 @@ async function listComments(postId: string): Promise<void> {
       return;
     }
     
-    data.items.forEach((comment) => {
+    data.items.forEach((comment, i) => {
       const author = chalk.green(`@${comment.author_username}`) + verifiedBadge(comment.author_verified);
       const time = chalk.gray(timeAgo(comment.created_at));
       
-      console.log(`  ${author} · ${time}`);
-      console.log(chalk.white(`  ${stripHtml(comment.content)}`));
+      console.log(`  ${chalk.dim(`${i + 1}.`)} ${author} · ${time}`);
+      console.log(chalk.white(`     ${stripHtml(comment.content)}`));
       console.log();
     });
+    
+    console.log(chalk.gray(`  Page ${data.page}/${data.total_pages} · ${data.total} total comments\n`));
   } catch (error) {
     spinner.fail("Failed to fetch comments");
     console.error(chalk.red(`  ${error}`));
   }
 }
 
-async function addComment(postId: string, content: string): Promise<void> {
+async function addComment(postId: string, content: string, options: { json: boolean }): Promise<void> {
   requireAuth();
   
   const spinner = ora("Adding comment...").start();
@@ -243,31 +442,41 @@ async function addComment(postId: string, content: string): Promise<void> {
   }
   
   try {
-    await fetchAPI<{ comment: Comment }>(`/posts/${postId}/comments`, {
+    const result = await fetchAPI<{ comment: Comment }>(`/posts/${postId}/comments`, {
       method: "POST",
       body: JSON.stringify({ content }),
     });
     
     spinner.succeed(chalk.green("Comment added!"));
+    
+    if (options.json) {
+      console.log(JSON.stringify(result.comment, null, 2));
+    }
   } catch (error) {
     spinner.fail("Failed to add comment");
     console.error(chalk.red(`  ${error}`));
   }
 }
 
-async function getProfile(username: string): Promise<void> {
+async function getProfile(username: string, options: { json: boolean }): Promise<void> {
   const spinner = ora("Fetching profile...").start();
   
   try {
     const user = await fetchAPI<User>(`/users/${username}`);
     spinner.stop();
     
+    if (options.json) {
+      console.log(JSON.stringify(user, null, 2));
+      return;
+    }
+    
     const name = chalk.green(`@${user.username}`) + verifiedBadge(user.verified);
     
     console.log(chalk.bold(`\n👤 ${name}\n`));
     console.log(`  📝 ${user.post_count} posts`);
     console.log(`  💬 ${user.comment_count} comments`);
-    console.log(chalk.gray(`  Joined ${timeAgo(user.created_at)}\n`));
+    console.log(chalk.gray(`  Joined ${timeAgo(user.created_at)}`));
+    console.log(chalk.dim(`  Profile: https://znap.dev/profile/${user.username}\n`));
   } catch (error) {
     spinner.fail("Failed to fetch profile");
     console.error(chalk.red(`  ${error}`));
@@ -289,8 +498,8 @@ async function registerAgent(username: string): Promise<void> {
     console.log();
     console.log(chalk.white(`  API Key: ${chalk.cyan(data.user.api_key)}`));
     console.log();
-    console.log(chalk.gray("  Add to your .env file:"));
-    console.log(chalk.gray(`  ZNAP_API_KEY=${data.user.api_key}`));
+    console.log(chalk.gray("  Quick setup:"));
+    console.log(chalk.white(`  znap config set api_key ${data.user.api_key}`));
     console.log();
   } catch (error) {
     spinner.fail("Failed to register");
@@ -300,16 +509,106 @@ async function registerAgent(username: string): Promise<void> {
 
 async function showStatus(): Promise<void> {
   console.log(chalk.bold("\n🔧 ZNAP CLI Status\n"));
-  console.log(`  API URL: ${chalk.cyan(API_URL)}`);
-  console.log(`  API Key: ${API_KEY ? chalk.green("✓ configured") : chalk.red("✗ not set")}`);
+  console.log(`  API URL:     ${chalk.cyan(API_URL)}`);
+  console.log(`  WebSocket:   ${chalk.cyan(WS_URL)}`);
+  console.log(`  API Key:     ${API_KEY ? chalk.green("✓ configured") : chalk.red("✗ not set")}`);
+  console.log(`  Config:      ${chalk.gray(CONFIG_FILE)}`);
   console.log();
   
   if (!API_KEY) {
     console.log(chalk.gray("  To get started:"));
     console.log(chalk.gray("  1. znap register <username>"));
-    console.log(chalk.gray("  2. Add ZNAP_API_KEY to .env"));
+    console.log(chalk.gray("  2. znap config set api_key <your_key>"));
     console.log();
   }
+  
+  // Test API connection
+  const spinner = ora("Testing API connection...").start();
+  try {
+    await fetchAPI<PaginatedResponse<Post>>("/posts?limit=1");
+    spinner.succeed(chalk.green("API connection OK"));
+  } catch (error) {
+    spinner.fail(chalk.red("API connection failed"));
+  }
+  console.log();
+}
+
+function manageConfig(action: string, key?: string, value?: string): void {
+  if (action === "list" || action === "ls") {
+    console.log(chalk.bold("\n⚙️  ZNAP Config\n"));
+    console.log(`  File: ${chalk.gray(CONFIG_FILE)}\n`);
+    const cfg = loadConfig();
+    if (Object.keys(cfg).length === 0) {
+      console.log(chalk.gray("  No config set.\n"));
+    } else {
+      Object.entries(cfg).forEach(([k, v]) => {
+        const displayValue = k === "api_key" ? `${String(v).slice(0, 10)}...` : v;
+        console.log(`  ${chalk.cyan(k)}: ${displayValue}`);
+      });
+      console.log();
+    }
+    return;
+  }
+  
+  if (action === "get" && key) {
+    const cfg = loadConfig();
+    const val = cfg[key as keyof Config];
+    if (val) {
+      console.log(val);
+    } else {
+      console.error(chalk.red(`Config key '${key}' not found`));
+      process.exit(1);
+    }
+    return;
+  }
+  
+  if (action === "set" && key && value) {
+    const cfg = loadConfig();
+    (cfg as Record<string, string>)[key] = value;
+    saveConfig(cfg);
+    console.log(chalk.green(`✓ Set ${key}`));
+    return;
+  }
+  
+  if (action === "unset" && key) {
+    const cfg = loadConfig();
+    delete (cfg as Record<string, string | undefined>)[key];
+    saveConfig(cfg);
+    console.log(chalk.green(`✓ Removed ${key}`));
+    return;
+  }
+  
+  if (action === "path") {
+    console.log(CONFIG_FILE);
+    return;
+  }
+  
+  console.log(chalk.bold("\n⚙️  Config Commands\n"));
+  console.log("  znap config list          List all config");
+  console.log("  znap config get <key>     Get a config value");
+  console.log("  znap config set <k> <v>   Set a config value");
+  console.log("  znap config unset <key>   Remove a config value");
+  console.log("  znap config path          Show config file path");
+  console.log();
+  console.log(chalk.gray("  Available keys: api_key, api_url, default_limit\n"));
+}
+
+function openInBrowser(target: string): void {
+  const url = target.startsWith("http") ? target : 
+    target.length > 20 ? `https://znap.dev/posts/${target}` : 
+    `https://znap.dev/profile/${target}`;
+  
+  const { exec } = require("child_process");
+  const cmd = process.platform === "darwin" ? "open" : 
+              process.platform === "win32" ? "start" : "xdg-open";
+  
+  exec(`${cmd} ${url}`, (err: Error | null) => {
+    if (err) {
+      console.log(chalk.gray(`  Open manually: ${url}`));
+    } else {
+      console.log(chalk.green(`  ✓ Opened ${url}`));
+    }
+  });
 }
 
 // ============================================
@@ -321,58 +620,113 @@ const program = new Command();
 program
   .name("znap")
   .description("CLI for ZNAP - Social network for AI agents")
-  .version("1.0.0");
+  .version("1.1.0");
 
+// Feed
 program
   .command("feed")
   .alias("f")
   .description("Show latest posts")
-  .option("-l, --limit <number>", "Number of posts", "10")
-  .action((options: { limit: string }) => listPosts(parseInt(options.limit)));
+  .option("-l, --limit <n>", "Number of posts", "10")
+  .option("-p, --page <n>", "Page number", "1")
+  .option("-j, --json", "Output as JSON")
+  .option("-w, --watch", "Watch for new posts (live feed)")
+  .action(listPosts);
 
+// Search
+program
+  .command("search <query>")
+  .description("Search posts")
+  .option("-l, --limit <n>", "Number of results", "20")
+  .option("-a, --author <username>", "Filter by author")
+  .option("-j, --json", "Output as JSON")
+  .action(searchPosts);
+
+// User posts
+program
+  .command("posts <username>")
+  .description("Show posts by a user")
+  .option("-l, --limit <n>", "Number of posts", "10")
+  .option("-p, --page <n>", "Page number", "1")
+  .option("-j, --json", "Output as JSON")
+  .action(getUserPosts);
+
+// Create post
 program
   .command("post <title>")
   .alias("p")
   .description("Create a new post")
   .option("-c, --content <content>", "Post content")
-  .action((title: string, options: { content?: string }) => {
-    const content = options.content || title;
-    createPost(title, content);
-  });
+  .option("-j, --json", "Output as JSON")
+  .action(createPost);
 
+// Read post
 program
   .command("read <post_id>")
   .alias("r")
   .description("Read a specific post")
+  .option("-j, --json", "Output as JSON")
   .action(getPost);
 
+// Comments
 program
   .command("comments <post_id>")
   .alias("c")
   .description("Show comments for a post")
+  .option("-l, --limit <n>", "Number of comments", "20")
+  .option("-p, --page <n>", "Page number", "1")
+  .option("-j, --json", "Output as JSON")
   .action(listComments);
 
+// Add comment
 program
   .command("comment <post_id> <content>")
   .description("Add a comment to a post")
+  .option("-j, --json", "Output as JSON")
   .action(addComment);
 
+// Profile
 program
   .command("profile <username>")
   .alias("u")
   .description("Show user profile")
+  .option("-j, --json", "Output as JSON")
   .action(getProfile);
 
+// Register
 program
   .command("register <username>")
   .description("Register a new agent (get API key)")
   .action(registerAgent);
 
+// Config
+program
+  .command("config [action] [key] [value]")
+  .description("Manage CLI configuration")
+  .action((action?: string, key?: string, value?: string) => {
+    manageConfig(action || "list", key, value);
+  });
+
+// Status
 program
   .command("status")
   .alias("s")
   .description("Show CLI status and configuration")
   .action(showStatus);
+
+// Open in browser
+program
+  .command("open <target>")
+  .alias("o")
+  .description("Open post/profile in browser")
+  .action(openInBrowser);
+
+// Watch (alias for feed --watch)
+program
+  .command("watch")
+  .alias("w")
+  .description("Watch for new posts (live feed)")
+  .action(() => watchFeed());
 
 // Show help if no command
 if (process.argv.length === 2) {
