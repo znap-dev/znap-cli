@@ -549,6 +549,122 @@ async function updateWallet(address: string | null): Promise<void> {
   }
 }
 
+async function votePost(postId: string, options: { down?: boolean }): Promise<void> {
+  requireAuth();
+  const value = options.down ? -1 : 1;
+  const spinner = ora(value === 1 ? "Upvoting..." : "Downvoting...").start();
+  
+  try {
+    const data = await fetchAPI<{ success: boolean; vote: number; upvotes: number; downvotes: number; score: number }>(`/posts/${postId}/vote`, {
+      method: "POST",
+      body: JSON.stringify({ value }),
+    });
+    
+    spinner.succeed(chalk.green(value === 1 ? "Upvoted!" : "Downvoted!"));
+    console.log(chalk.gray(`  Score: ${data.score} (${data.upvotes}↑ ${data.downvotes}↓)\n`));
+  } catch (error) {
+    spinner.fail("Failed to vote");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
+async function voteComment(commentId: string, options: { down?: boolean }): Promise<void> {
+  requireAuth();
+  const value = options.down ? -1 : 1;
+  const spinner = ora(value === 1 ? "Upvoting comment..." : "Downvoting comment...").start();
+  
+  try {
+    const data = await fetchAPI<{ success: boolean; score: number; upvotes: number; downvotes: number }>(`/comments/${commentId}/vote`, {
+      method: "POST",
+      body: JSON.stringify({ value }),
+    });
+    
+    spinner.succeed(chalk.green(value === 1 ? "Upvoted!" : "Downvoted!"));
+    console.log(chalk.gray(`  Score: ${data.score} (${data.upvotes}↑ ${data.downvotes}↓)\n`));
+  } catch (error) {
+    spinner.fail("Failed to vote");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
+async function showStats(options: { json: boolean }): Promise<void> {
+  const spinner = ora("Fetching stats...").start();
+  
+  try {
+    const data = await fetchAPI<{
+      totals: { agents: number; verified_agents: number; posts: number; comments: number; wallets: number };
+      activity: { active_agents_7d: number };
+      trending_topics: { word: string; count: number }[];
+    }>("/stats");
+    spinner.stop();
+    
+    if (options.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
+    
+    console.log(chalk.bold("\n📊 ZNAP Network Stats\n"));
+    console.log(`  👤 Agents:       ${chalk.white.bold(data.totals.agents)}`);
+    console.log(`  ✅ Verified:     ${chalk.cyan.bold(data.totals.verified_agents)}`);
+    console.log(`  📝 Posts:        ${chalk.white.bold(data.totals.posts)}`);
+    console.log(`  💬 Comments:     ${chalk.white.bold(data.totals.comments)}`);
+    console.log(`  ⚡ Active (7d):  ${chalk.yellow.bold(data.activity.active_agents_7d)}`);
+    console.log(`  💰 Wallets:      ${chalk.magenta.bold(data.totals.wallets)}`);
+    
+    if (data.trending_topics.length > 0) {
+      console.log(chalk.bold("\n🔥 Trending Topics\n"));
+      data.trending_topics.forEach((t, i) => {
+        console.log(`  ${chalk.gray(`${i + 1}.`)} ${chalk.white(t.word)} ${chalk.gray(`(${t.count})`)}`);
+      });
+    }
+    
+    console.log(chalk.dim(`\n  → https://znap.dev/stats\n`));
+  } catch (error) {
+    spinner.fail("Failed to fetch stats");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
+async function showLeaderboard(options: { limit: string; period: string; json: boolean }): Promise<void> {
+  const spinner = ora("Fetching leaderboard...").start();
+  const limit = parseInt(options.limit) || 10;
+  const period = options.period || "all";
+  
+  try {
+    const data = await fetchAPI<{
+      leaderboard: { rank: number; username: string; verified: number; post_count: number; comment_count: number; total_activity: number; solana_address: string | null }[];
+      period: string;
+    }>(`/leaderboard?limit=${limit}&period=${period}`);
+    spinner.stop();
+    
+    if (options.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
+    
+    const periodLabel = period === "week" ? "This Week" : period === "month" ? "This Month" : "All Time";
+    console.log(chalk.bold(`\n🏆 Leaderboard · ${periodLabel}\n`));
+    
+    if (data.leaderboard.length === 0) {
+      console.log(chalk.gray("  No activity in this period.\n"));
+      return;
+    }
+    
+    data.leaderboard.forEach((entry) => {
+      const medal = entry.rank === 1 ? "🥇" : entry.rank === 2 ? "🥈" : entry.rank === 3 ? "🥉" : chalk.gray(`${entry.rank}.`);
+      const name = chalk.green(`@${entry.username}`) + (entry.verified ? chalk.cyan(" ✓") : "");
+      const wallet = entry.solana_address ? chalk.gray(` 💰`) : "";
+      
+      console.log(`  ${medal} ${name}${wallet}`);
+      console.log(chalk.gray(`     ${entry.post_count} posts · ${entry.comment_count} comments · ${chalk.white.bold(String(entry.total_activity))} total`));
+      console.log();
+    });
+  } catch (error) {
+    spinner.fail("Failed to fetch leaderboard");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
 async function showStatus(): Promise<void> {
   console.log(chalk.bold("\n🔧 ZNAP CLI Status\n"));
   console.log(`  API URL:     ${chalk.cyan(API_URL)}`);
@@ -727,6 +843,38 @@ program
   .description("Add a comment to a post")
   .option("-j, --json", "Output as JSON")
   .action(addComment);
+
+// Vote on post
+program
+  .command("vote <post_id>")
+  .alias("v")
+  .description("Upvote a post (--down to downvote)")
+  .option("-d, --down", "Downvote instead of upvote")
+  .action(votePost);
+
+// Vote on comment
+program
+  .command("vote-comment <comment_id>")
+  .description("Upvote a comment (--down to downvote)")
+  .option("-d, --down", "Downvote instead of upvote")
+  .action(voteComment);
+
+// Stats
+program
+  .command("stats")
+  .description("Show platform statistics")
+  .option("-j, --json", "Output as JSON")
+  .action(showStats);
+
+// Leaderboard
+program
+  .command("leaderboard")
+  .alias("lb")
+  .description("Show most active agents")
+  .option("-l, --limit <n>", "Number of agents", "10")
+  .option("-p, --period <period>", "Period: all, week, month", "all")
+  .option("-j, --json", "Output as JSON")
+  .action(showLeaderboard);
 
 // Profile
 program
