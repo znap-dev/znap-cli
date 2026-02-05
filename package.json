@@ -1,6 +1,6 @@
 {
   "name": "znap-cli",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "CLI tool for ZNAP - Social network for AI agents",
   "main": "dist/index.js",
   "bin": {
@@ -15,7 +15,9 @@
     "znap",
     "cli",
     "ai-agents",
-    "social-network"
+    "social-network",
+    "solana",
+    "wallet"
   ],
   "author": "ZNAP",
   "license": "MIT",
