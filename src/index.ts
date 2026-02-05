@@ -268,38 +268,43 @@ async function watchFeed(): Promise<void> {
   }, 30000);
 }
 
-async function searchPosts(query: string, options: { limit: string; author?: string; json: boolean }): Promise<void> {
+async function searchPosts(query: string, options: { limit: string; page: string; author?: string; json: boolean }): Promise<void> {
   const spinner = ora("Searching...").start();
   const limit = parseInt(options.limit) || 20;
+  const page = parseInt(options.page) || 1;
   
   try {
-    // Fetch more posts and filter client-side (API doesn't have search yet)
-    const data = await fetchAPI<PaginatedResponse<Post>>(`/posts?limit=50`);
+    // Server-side search
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    if (options.author) params.set("author", options.author);
+    params.set("limit", String(limit));
+    params.set("page", String(page));
+    
+    const data = await fetchAPI<PaginatedResponse<Post> & { query?: string; author?: string }>(
+      `/posts/search?${params.toString()}`
+    );
     spinner.stop();
     
-    let results = data.items.filter(post => {
-      const matchQuery = query ? 
-        post.title.toLowerCase().includes(query.toLowerCase()) ||
-        stripHtml(post.content).toLowerCase().includes(query.toLowerCase()) : true;
-      const matchAuthor = options.author ? 
-        post.author_username.toLowerCase() === options.author.toLowerCase() : true;
-      return matchQuery && matchAuthor;
-    }).slice(0, limit);
-    
     if (options.json) {
-      console.log(JSON.stringify({ items: results, total: results.length }, null, 2));
+      console.log(JSON.stringify(data, null, 2));
       return;
     }
     
     console.log(chalk.bold(`\n🔍 Search: "${query}"${options.author ? ` by @${options.author}` : ""}\n`));
     
-    if (results.length === 0) {
+    if (data.items.length === 0) {
       console.log(chalk.gray("  No posts found.\n"));
       return;
     }
     
-    results.forEach((post, i) => formatPost(post, i));
-    console.log(chalk.gray(`  Found ${results.length} posts\n`));
+    data.items.forEach((post, i) => formatPost(post, i));
+    
+    console.log(chalk.gray(`  Page ${data.page}/${data.total_pages} · ${data.total} results`));
+    if (data.page < data.total_pages) {
+      console.log(chalk.gray(`  Next: znap search "${query}" --page ${data.page + 1}`));
+    }
+    console.log();
   } catch (error) {
     spinner.fail("Search failed");
     console.error(chalk.red(`  ${error}`));
@@ -673,8 +678,9 @@ program
 // Search
 program
   .command("search <query>")
-  .description("Search posts")
+  .description("Search posts (server-side)")
   .option("-l, --limit <n>", "Number of results", "20")
+  .option("-p, --page <n>", "Page number", "1")
   .option("-a, --author <username>", "Filter by author")
   .option("-j, --json", "Output as JSON")
   .action(searchPosts);
