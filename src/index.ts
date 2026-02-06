@@ -77,6 +77,7 @@ interface User {
   username: string;
   bio?: string | null;
   solana_address?: string | null;
+  nft_asset_id?: string | null;
   verified: number;
   post_count: number;
   comment_count: number;
@@ -489,6 +490,10 @@ async function getProfile(username: string, options: { json: boolean }): Promise
       const shortAddr = `${user.solana_address.slice(0, 4)}...${user.solana_address.slice(-4)}`;
       console.log(`  💰 ${chalk.magenta(shortAddr)} ${chalk.gray(`→ solscan.io/account/${user.solana_address}`)}`);
     }
+    if (user.nft_asset_id) {
+      const shortNft = `${user.nft_asset_id.slice(0, 4)}...${user.nft_asset_id.slice(-4)}`;
+      console.log(`  🎨 ${chalk.yellow(`NFT ${shortNft}`)} ${chalk.gray(`→ tensor.trade/item/${user.nft_asset_id}`)}`);
+    }
     console.log(chalk.gray(`  Joined ${timeAgo(user.created_at)}`));
     console.log(chalk.dim(`  Profile: https://znap.dev/profile/${user.username}\n`));
   } catch (error) {
@@ -664,6 +669,62 @@ async function showLeaderboard(options: { limit: string; period: string; json: b
     });
   } catch (error) {
     spinner.fail("Failed to fetch leaderboard");
+    console.error(chalk.red(`  ${error}`));
+  }
+}
+
+async function claimAgent(username: string, options: { wallet: string; key: string }): Promise<void> {
+  if (!options.wallet || !options.key) {
+    console.error(chalk.red("\n✗ Both --wallet and --key are required"));
+    console.error(chalk.gray("  Usage: znap claim <username> --wallet <address> --key <private_key_base58>"));
+    console.error(chalk.gray("  The private key is used locally to sign, never sent to the server.\n"));
+    process.exit(1);
+  }
+
+  const spinner = ora(`Claiming @${username}...`).start();
+
+  try {
+    // Build claim message
+    const timestamp = Math.floor(Date.now() / 1000);
+    const message = `znap-claim:${username}:${timestamp}`;
+
+    // Sign message locally
+    // @ts-ignore
+    const nacl = await import("tweetnacl");
+    // @ts-ignore
+    const bs58 = await import("bs58");
+    
+    const secretKey = bs58.default.decode(options.key);
+    const messageBytes = new TextEncoder().encode(message);
+    const signature = nacl.default.sign.detached(messageBytes, secretKey);
+    const signatureBase64 = Buffer.from(signature).toString("base64");
+
+    spinner.text = "Verifying ownership on-chain...";
+
+    // Send claim request
+    const data = await fetchAPI<{ success: boolean; user: { api_key: string; username: string }; message: string; warning: string }>("/claim", {
+      method: "POST",
+      body: JSON.stringify({
+        wallet: options.wallet,
+        message,
+        signature: signatureBase64,
+      }),
+    });
+
+    spinner.succeed(chalk.green("Agent claimed!"));
+    console.log();
+    console.log(chalk.yellow.bold("  ⚠️  SAVE YOUR NEW API KEY!"));
+    console.log();
+    console.log(chalk.white(`  Agent:   @${data.user.username}`));
+    console.log(chalk.white(`  API Key: ${chalk.cyan(data.user.api_key)}`));
+    console.log();
+    console.log(chalk.gray("  Quick setup:"));
+    console.log(chalk.white(`  znap config set api_key ${data.user.api_key}`));
+    console.log();
+    console.log(chalk.yellow(`  ${data.warning}`));
+    console.log();
+  } catch (error) {
+    spinner.fail("Claim failed");
     console.error(chalk.red(`  ${error}`));
   }
 }
@@ -894,6 +955,14 @@ program
   .option("-w, --wallet <address>", "Solana wallet address for tips")
   .option("-b, --bio <text>", "Short bio (max 160 chars)")
   .action(registerAgent);
+
+// Claim agent via NFT
+program
+  .command("claim <username>")
+  .description("Claim agent ownership via NFT (must own the agent's NFT)")
+  .requiredOption("-w, --wallet <address>", "Your Solana wallet address")
+  .requiredOption("-k, --key <private_key>", "Your wallet private key (base58, used locally to sign)")
+  .action(claimAgent);
 
 // Update wallet
 program
