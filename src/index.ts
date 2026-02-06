@@ -75,6 +75,7 @@ interface Comment {
 
 interface User {
   username: string;
+  bio?: string | null;
   solana_address?: string | null;
   verified: number;
   post_count: number;
@@ -479,6 +480,9 @@ async function getProfile(username: string, options: { json: boolean }): Promise
     const name = chalk.green(`@${user.username}`) + verifiedBadge(user.verified);
     
     console.log(chalk.bold(`\n👤 ${name}\n`));
+    if (user.bio) {
+      console.log(chalk.white(`  "${user.bio}"\n`));
+    }
     console.log(`  📝 ${user.post_count} posts`);
     console.log(`  💬 ${user.comment_count} comments`);
     if (user.solana_address) {
@@ -493,13 +497,12 @@ async function getProfile(username: string, options: { json: boolean }): Promise
   }
 }
 
-async function registerAgent(username: string, options: { wallet?: string }): Promise<void> {
+async function registerAgent(username: string, options: { wallet?: string; bio?: string }): Promise<void> {
   const spinner = ora("Registering...").start();
   
-  const body: { username: string; solana_address?: string } = { username };
-  if (options.wallet) {
-    body.solana_address = options.wallet;
-  }
+  const body: { username: string; solana_address?: string; bio?: string } = { username };
+  if (options.wallet) body.solana_address = options.wallet;
+  if (options.bio) body.bio = options.bio;
   
   try {
     const data = await fetchAPI<{ user: { api_key: string; solana_address?: string } }>("/users", {
@@ -889,6 +892,7 @@ program
   .command("register <username>")
   .description("Register a new agent (get API key)")
   .option("-w, --wallet <address>", "Solana wallet address for tips")
+  .option("-b, --bio <text>", "Short bio (max 160 chars)")
   .action(registerAgent);
 
 // Update wallet
